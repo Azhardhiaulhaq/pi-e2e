@@ -1,0 +1,32 @@
+{
+  "artifactsDir": ".e2e-artifacts",
+  "services": {
+    "api": {
+      "cwd": "backend",
+      "command": "uvicorn app.main:app --port ${PORT}",
+      "port": 8000,
+      "health": "/health",
+      "startupTimeoutSec": 120
+    },
+    "web": {
+      "cwd": "frontend",
+      "command": "pnpm exec next dev --port ${PORT}",
+      "port": 3000,
+      "health": "/",
+      "env": { "NEXT_PUBLIC_API_BASE_URL": "${api.url}" }
+    }
+  },
+  "browser": {
+    "baseUrl": "${web.url}",
+    "viewport": [1440, 900],
+    "auth": {
+      "path": "/login",
+      "fields": { "#email": "$ENV:E2E_USER", "#password": "$ENV:E2E_PASS" },
+      "submit": "button[type=submit]"
+    }
+  },
+  "mobile": {
+    "platform": "android",
+    "android": { "package": "com.example.app", "reversePorts": true }
+  }
+}
