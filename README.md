@@ -9,8 +9,8 @@ Works with any project. Each repo describes its services in one file: `.pi/e2e.j
 
 ```bash
 pi install git:github.com/Azhardhiaulhaq/pi-e2e          # latest main, all projects
-pi install git:github.com/Azhardhiaulhaq/pi-e2e@v0.2.0   # pinned to a release (recommended)
-pi install -l git:github.com/Azhardhiaulhaq/pi-e2e@v0.2.0  # this project only (.pi/settings.json)
+pi install git:github.com/Azhardhiaulhaq/pi-e2e@v0.3.0   # pinned to a release (recommended)
+pi install -l git:github.com/Azhardhiaulhaq/pi-e2e@v0.3.0  # this project only (.pi/settings.json)
 ```
 
 The install clones the repo, runs `npm install`, and downloads headless Chromium (~110 MB, once per machine).
@@ -43,20 +43,24 @@ Try it without installing: `pi -e git:github.com/Azhardhiaulhaq/pi-e2e`.
   },
   "browser": {
     "baseUrl": "${web.url}",
-    "auth": { "path": "/login", "fields": { "#email": "$ENV:E2E_USER", "#password": "$ENV:E2E_PASS" }, "submit": "button[type=submit]" }
+    "auth": { "path": "/login", "fields": { "#email": "{{email|username}}", "#password": "{{password}}" },
+              "submit": "button[type=submit]", "defaultUser": "admin" }
   }
 }
 ```
 Or just ask pi: *"set up .pi/e2e.json for this repo"*. The bundled skill knows the schema.
 
-**2. Export test credentials** before starting pi (never put them in prompts or config):
-```bash
-export E2E_USER=qa@example.com E2E_PASS='...'
+**2. Add your test users.** See [Credentials](#credentials-multiple-users-never-shown-to-the-model). The quickest way is inside pi:
+```
+/e2e cred add admin      # masked prompts for email/username + password
+/e2e cred add driver
 ```
 
 **3. Ask for a verified change:**
 
 > Fix the vehicle filter, then verify end to end: start the stack, log in, open /vehicles, filter status = Idle, confirm only idle units show. Screenshot before/after and give me a PASS/FAIL table.
+
+> Admin creates a delivery job, then log in as driver and accept it, then switch back to admin and confirm the job shows "Accepted".
 
 > Check that the dashboard is usable on iPhone 15: no horizontal scroll, menu opens.
 
@@ -69,8 +73,49 @@ export E2E_USER=qa@example.com E2E_PASS='...'
 | `e2e_stack` tool | `up` / `down` / `status` / `logs` / `config` for services in `.pi/e2e.json`. Starts in parallel, health-checked, reuses services that are already running, kills the whole process tree on exit. |
 | `browser` tool | Playwright Chromium: `goto click fill press select hover check wait snapshot text screenshot assert console network eval login reset close`. `reset {device:"iPhone 15"}` = mobile web. |
 | `mobile` tool | Android via adb (`devices launch stop install openurl screenshot ui tap type key swipe back logcat reverse`). iOS simulator via `xcrun simctl` (`devices launch stop install openurl screenshot`). |
-| `/e2e` command | For you: `/e2e up`, `/e2e down`, `/e2e status`, `/e2e logs api`, `/e2e setup`. |
+| `/e2e` command | For you: `/e2e up`, `/e2e down`, `/e2e status`, `/e2e logs api`, `/e2e setup`, `/e2e cred …`. |
 | `e2e-test` skill | Test procedure + full config schema. Loaded by the agent only when needed. |
+
+## Credentials: multiple users, never shown to the model
+
+The model only ever sees **references** like `$CRED:admin.password`. The real values are swapped in by the tool at the last moment, inside the browser or the adb call.
+
+**Three ways to provide users** (combine freely; the private store wins on conflicts):
+
+1. **`/e2e cred add <user>`**: masked prompts, saved to `~/.pi/agent/e2e/credentials.json` (mode 600, outside any repo, per project).
+2. **Env vars referenced from `.pi/e2e.json`.** This is the safe option to commit:
+   ```jsonc
+   "credentials": {
+     "admin":  { "email": "$ENV:E2E_ADMIN_EMAIL", "password": "$ENV:E2E_ADMIN_PASS" },
+     "driver": { "username": "$ENV:E2E_DRIVER_USER", "password": "$ENV:E2E_DRIVER_PASS", "pin": "$ENV:E2E_DRIVER_PIN" }
+   }
+   ```
+3. **Just say it in chat**, e.g. *"test as admin, email: boss@acme.io password: Hunter#22, and driver d1@acme.io / s3cret"*.
+   Before the message reaches the model, the extension moves the values to the private store and rewrites the message to `$CRED:admin.email`, `$CRED:admin.password`, and so on. A 🔒 notice tells you which users it saved. Fix a wrong guess with `/e2e cred rename user admin`.
+
+**Using them:**
+- `browser login {user:"driver"}` fills `browser.auth.fields`. `{{email|username}}` means "the user's email, or else their username".
+- Each user's session is saved separately (`.e2e-artifacts/.auth-<user>.json`), so `browser reset {user:"admin"}` switches back without logging in again.
+- Free-form forms work too: `fill {selector:"#pin", value:"$CRED:driver.pin"}`, `mobile type {value:"$CRED:driver.password"}`.
+
+**Layers of protection:**
+
+| Layer | What it does |
+|---|---|
+| Chat input | Credentials you type are stored and replaced with `$CRED` references. Text inside \`\`\` code fences is left alone. |
+| Tool calls | If the model writes a real value anyway, it's swapped back to its reference before the tool runs. |
+| Tool results | Every known value is scrubbed from **all** tool output (`bash`, `read`, page text, logs, errors), including URL-encoded forms. |
+| Model context | A final scrub of the whole conversation before every model call. |
+| Disk | Store mode 600 in your home dir. Session files sit in `.e2e-artifacts/` (self-gitignored). |
+
+`/e2e cred list` (or the model's `e2e_stack {action:"credentials"}`) shows users, fields and where each comes from, never the values.
+Set `"captureCredentials": false` to turn off chat capture.
+
+**Limits (be aware):**
+- Values shorter than 4 characters, or purely numeric ones under 6 (e.g. a 4-digit PIN), are not scrubbed from output; they would clash with ordinary numbers. Use longer test PINs, or treat them as non-secret.
+- Chat capture recognises common phrasings (`password: x`, `email x / pass`, `login as admin with a@b.com / x`, `kata sandi: x`). Unusual wording may slip through. After that the value is still scrubbed from tool output, but it was already in your own message. Prefer `/e2e cred add` for real accounts.
+- Screenshots are images and can't be redacted. Password fields are masked by the browser; avoid screenshotting pages that display secrets in plain text.
+- Use dedicated **test accounts**, never your personal production login.
 
 ## Config reference
 
@@ -87,11 +132,11 @@ Full schema with comments: [`skills/e2e-test/SKILL.md`](skills/e2e-test/SKILL.md
 Everything goes to `<project>/.e2e-artifacts/` (`artifactsDir`). That folder writes its own `.gitignore`, so nothing in it gets committed:
 - `logs/<service>.log`: service stdout/stderr
 - `screenshots/<session>-<n>-<label>.jpg`
-- `.auth-state.json`: saved login session (cookies + localStorage). Treat it like a password. `browser {action:"reset", fresh:true}` deletes it.
+- `.auth-<user>.json`: saved login session per user (cookies + localStorage). Treat these like passwords. `browser {action:"reset", user:"x", fresh:true}` deletes one.
 
 ## Security
 
-- Credentials: use `$ENV:NAME` only. Values filled from env vars are never echoed in tool results.
+- Credentials: see above. References only, scrubbed everywhere.
 - `.pi/e2e.json` contains shell commands that pi runs. Review it in repos you don't trust, the same as a `Makefile`.
 - `browser eval` runs arbitrary JS in the page under test. That's intended for debugging your own app.
 
@@ -117,7 +162,7 @@ Everything goes to `<project>/.e2e-artifacts/` (`artifactsDir`). That folder wri
 ```bash
 git clone git@github.com:Azhardhiaulhaq/pi-e2e.git && cd pi-e2e
 npm install --legacy-peer-deps
-npm run typecheck
+npm run typecheck && npm test
 pi install ./        # load your working copy instead of the git install
 ```
 

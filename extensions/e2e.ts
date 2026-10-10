@@ -22,6 +22,22 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Browser, BrowserContext, Page } from "playwright";
+import {
+	captureFromText,
+	credUsers,
+	type CredentialsCfg,
+	describeCreds,
+	expandTemplate,
+	hasSecrets,
+	redact,
+	redactDeep,
+	registerAll,
+	removeCred,
+	renameCred,
+	resolveSecret,
+	saveCred,
+} from "../lib/credentials.ts";
+import { askSecret } from "../lib/secret-prompt.ts";
 
 const run = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -40,13 +56,20 @@ interface ServiceCfg {
 }
 interface AuthCfg {
 	path: string;
+	/** selector → value. Values: "{{email|username}}" / "{{password}}" (from the chosen user), "$CRED:user.field", "$ENV:NAME" */
 	fields: Record<string, string>;
 	submit: string;
 	successSelector?: string;
+	/** user to log in as when `browser login` gets no `user` */
+	defaultUser?: string;
 }
 interface E2EConfig {
 	artifactsDir?: string;
 	keepRunning?: boolean;
+	/** Named test users. Values should be "$ENV:NAME"; secrets can also live in the private store (/e2e cred add). */
+	credentials?: CredentialsCfg;
+	/** Replace credentials typed in chat with $CRED references (default true) */
+	captureCredentials?: boolean;
 	services: Record<string, ServiceCfg>;
 	browser?: { baseUrl?: string; viewport?: [number, number]; device?: string; auth?: AuthCfg };
 	mobile?: {
@@ -83,6 +106,7 @@ function loadConfig(cwd: string): Loaded {
 	const cfg = JSON.parse(readFileSync(file, "utf8")) as E2EConfig;
 	if (!cfg.services || typeof cfg.services !== "object") throw new Error(`${file}: "services" is required`);
 	loaded = { root: path.dirname(path.dirname(file)), file, mtime, cfg };
+	registerAll(loaded.root, cfg.credentials, envRefs(cfg));
 	return loaded;
 }
 
@@ -102,15 +126,14 @@ function interp(str: string, cfg: E2EConfig, self?: ServiceCfg): string {
 	});
 }
 
-/** "$ENV:NAME" → value of NAME. Keeps secrets out of tool arguments and transcripts. */
-function secret(v: string | undefined): string | undefined {
-	if (v?.startsWith("$ENV:")) {
-		const name = v.slice(5);
-		const val = process.env[name];
-		if (val === undefined) throw new Error(`Environment variable ${name} is not set (export it before starting pi).`);
-		return val;
-	}
-	return v;
+/** All "$ENV:NAME" names used anywhere in the config (their values get redacted too). */
+function envRefs(cfg: E2EConfig): string[] {
+	return [...JSON.stringify(cfg).matchAll(/\$ENV:(\w+)/g)].map((m) => m[1]);
+}
+
+/** "$ENV:NAME" / "$CRED:user.field" → real value. Keeps secrets out of tool arguments and transcripts. */
+function secret(l: Loaded, v: string | undefined): string | undefined {
+	return resolveSecret(v, l.root, l.cfg.credentials);
 }
 
 function artifacts(l: Loaded, sub = ""): string {
@@ -295,9 +318,12 @@ async function getBrowser(): Promise<Browser> {
 	return browser;
 }
 
-function authFile(l: Loaded) {
-	return path.join(artifacts(l), ".auth-state.json");
+/** Saved browser session per test user (cookies + localStorage), so switching users needs no re-login. */
+function authFile(l: Loaded, user = currentUser) {
+	return path.join(artifacts(l), user ? `.auth-${user.replace(/[^\w-]/g, "_")}.json` : ".auth-state.json");
 }
+
+let currentUser: string | undefined;
 
 async function getPage(l: Loaded, opts: { device?: string; recreate?: boolean; loggedOut?: boolean } = {}): Promise<Page> {
 	const want = opts.recreate ? (opts.device ?? l.cfg.browser?.device) : (device ?? l.cfg.browser?.device);
@@ -425,6 +451,40 @@ function findNode(nodes: UiNode[], query: string): UiNode {
 	return hit;
 }
 
+// ───────────────────────── /e2e cred ─────────────────────────
+
+async function credCommand(l: Loaded, args: string[], ctx: ExtensionContext) {
+	const [sub = "list", user, to] = args;
+	if (sub === "list") return ctx.ui.notify(describeCreds(l.root, l.cfg.credentials), "info");
+	if (sub === "rm" || sub === "remove") {
+		if (!user) throw new Error("usage: /e2e cred rm <user>");
+		return ctx.ui.notify(removeCred(l.root, user) ? `removed ${user}` : `${user} is not in the private store`, "info");
+	}
+	if (sub === "rename" || sub === "mv") {
+		if (!user || !to) throw new Error("usage: /e2e cred rename <from> <to>");
+		return ctx.ui.notify(renameCred(l.root, user, to) ? `renamed ${user} → ${to}` : `${user} is not in the private store`, "info");
+	}
+	if (sub === "add" || sub === "set") {
+		if (!user || !/^[\w-]+$/.test(user)) throw new Error("usage: /e2e cred add <user>   (letters, digits, - or _)");
+		if (!ctx.hasUI) throw new Error("/e2e cred add needs the interactive UI");
+		const fields: Record<string, string> = {};
+		const login = await askSecret(ctx, `${user}: email or username (Esc to skip)`, false);
+		if (login) fields[login.includes("@") ? "email" : "username"] = login;
+		const pw = await askSecret(ctx, `${user}: password (Esc to skip)`);
+		if (pw) fields.password = pw;
+		for (;;) {
+			const extra = await askSecret(ctx, `${user}: another field name, e.g. pin / otp_secret (Enter when done)`, false);
+			if (!extra?.trim()) break;
+			const v = await askSecret(ctx, `${user}.${extra.trim()}`);
+			if (v) fields[extra.trim()] = v;
+		}
+		if (!Object.keys(fields).length) return ctx.ui.notify("nothing saved", "warning");
+		saveCred(l.root, user, fields);
+		return ctx.ui.notify(`🔒 saved ${user}: ${Object.keys(fields).join(", ")}  → refer to it as $CRED:${user}.<field>`, "info");
+	}
+	throw new Error("usage: /e2e cred [list | add <user> | rm <user> | rename <from> <to>]");
+}
+
 // ───────────────────────── extension ─────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -434,10 +494,10 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Start/stop/inspect the local services declared in .pi/e2e.json (e.g. backend, frontend). " +
 			"`up` starts services (and their dependsOn) in parallel and waits for health; services already running on their port are reused. " +
-			"`logs` returns the last lines of a service log. Use before browser/mobile testing.",
+			"`logs` returns the last lines of a service log. `credentials` lists the test users and their fields (never values). Use before browser/mobile testing.",
 		promptSnippet: "Start/stop local backend/frontend services for end-to-end testing",
 		parameters: Type.Object({
-			action: StringEnum(["up", "down", "status", "logs", "config"] as const),
+			action: StringEnum(["up", "down", "status", "logs", "config", "credentials"] as const),
 			services: Type.Optional(Type.Array(Type.String(), { description: "Service names; default all (for logs: first one)" })),
 			lines: Type.Optional(Type.Number({ description: "logs: number of lines (default 60)" })),
 		}),
@@ -447,7 +507,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				switch (p.action) {
 					case "config":
-						return text(`${l.file}\n${JSON.stringify(l.cfg, null, 2)}`);
+						return text(redact(`${l.file}\n${JSON.stringify(l.cfg, null, 2)}`));
+					case "credentials":
+						return text(describeCreds(l.root, l.cfg.credentials));
 					case "status":
 						return text(await stackStatus(l));
 					case "up": {
@@ -487,7 +549,10 @@ export default function (pi: ExtensionAPI) {
 			"Actions: goto, click, fill, press, select, hover, check, wait, snapshot, text, screenshot, assert, console, network, eval, login, reset, close. " +
 			"Selectors are Playwright selectors: 'role=button[name=\"Save\"]', 'text=Sign in', '#email', 'css=.row >> nth=0'. " +
 			"Prefer `snapshot` (accessibility tree, cheap) to discover elements and `assert` to verify; use `screenshot` for visual/layout checks (returned as an image). " +
-			"`reset` with `device` (e.g. 'iPhone 15', 'Pixel 7') emulates a mobile browser. Values like '$ENV:NAME' are read from the environment (use for credentials).",
+			"`reset` with `device` (e.g. 'iPhone 15', 'Pixel 7') emulates a mobile browser. " +
+			"Multiple test users: `login {user:\"admin\"}` logs in as that user (each user keeps its own saved session); `reset {user:\"driver\"}` switches to a user's saved session. " +
+			"Credentials: NEVER type literal emails/usernames/passwords. Use references in `value`: '$CRED:<user>.<field>' (e.g. '$CRED:admin.password') or '$ENV:NAME'. " +
+			"List available users with e2e_stack {action:\"credentials\"}.",
 		promptSnippet: "Navigate, interact with, screenshot and assert on web pages in a headless browser",
 		parameters: Type.Object({
 			action: StringEnum(
@@ -498,6 +563,7 @@ export default function (pi: ExtensionAPI) {
 			value: Type.Optional(Type.String({ description: "fill/select value, press key (e.g. Enter), eval JS expression, assert: text that must appear" })),
 			device: Type.Optional(Type.String({ description: "reset: Playwright device name for mobile emulation; omit for desktop" })),
 			fresh: Type.Optional(Type.Boolean({ description: "reset: drop saved login state" })),
+			user: Type.Optional(Type.String({ description: "login/reset: test user name from credentials (e.g. admin, driver)" })),
 			fullPage: Type.Optional(Type.Boolean()),
 			name: Type.Optional(Type.String({ description: "screenshot file label" })),
 			attach: Type.Optional(Type.Boolean({ description: "screenshot: return the image to the model (default true)" })),
@@ -515,9 +581,19 @@ export default function (pi: ExtensionAPI) {
 				return text("browser closed");
 			}
 			if (p.action === "reset") {
+				if (p.user !== undefined) currentUser = p.user || undefined;
 				if (p.fresh) rmSync(authFile(l), { force: true });
 				await getPage(l, { device: p.device, recreate: true, loggedOut: p.fresh });
-				return text(`new ${device ?? "desktop"} context${p.fresh ? " (logged out)" : existsSync(authFile(l)) ? " (saved login reused)" : ""}`);
+				const who = currentUser ? ` as ${currentUser}` : "";
+				return text(`new ${device ?? "desktop"} context${who}${p.fresh ? " (logged out)" : existsSync(authFile(l)) ? " (saved login reused)" : " (no saved login; use login)"}`);
+			}
+			if (p.action === "login") {
+				const users = credUsers(l.root, l.cfg.credentials);
+				const user = p.user ?? l.cfg.browser?.auth?.defaultUser ?? currentUser ?? (users.length === 1 ? users[0] : undefined);
+				if (p.user && !users.includes(p.user)) throw new Error(`Unknown user "${p.user}". Known:\n${describeCreds(l.root, l.cfg.credentials)}`);
+				currentUser = user;
+				// always start logged out, otherwise /login may redirect away before the form is filled
+				await getPage(l, { recreate: true, loggedOut: true, device });
 			}
 			const pg = await getPage(l);
 			switch (p.action) {
@@ -532,7 +608,7 @@ export default function (pi: ExtensionAPI) {
 					await settle(pg);
 					return text(withHints(`clicked → ${pg.url()}`));
 				case "fill":
-					await pg.locator(need("selector")).first().fill(secret(p.value) ?? "", { timeout });
+					await pg.locator(need("selector")).first().fill(secret(l, p.value) ?? "", { timeout });
 					return text(withHints(`filled ${p.selector}`)); // never echo the value
 				case "press":
 					if (p.selector) await pg.locator(p.selector).first().press(need("value"), { timeout });
@@ -621,10 +697,23 @@ export default function (pi: ExtensionAPI) {
 					if (!a) throw new Error('No browser.auth in .pi/e2e.json; log in manually with goto/fill/click.');
 					await pg.goto(a.path, { waitUntil: "commit", timeout: 30_000 });
 					await settle(pg);
-					for (const [sel, v] of Object.entries(a.fields)) await pg.locator(sel).first().fill(secret(v) ?? "", { timeout });
+					for (const [sel, v] of Object.entries(a.fields)) {
+						const val = v.includes("{{")
+							? (() => {
+									if (!currentUser) throw new Error(`browser.auth uses {{…}} templates: pass login {user:"…"}. Known:\n${describeCreds(l.root, l.cfg.credentials)}`);
+									return expandTemplate(v, currentUser, l.root, l.cfg.credentials);
+								})()
+							: secret(l, v);
+						await pg.locator(sel).first().fill(val ?? "", { timeout });
+					}
 					await pg.locator(a.submit).first().click({ timeout });
-					if (a.successSelector) await pg.locator(a.successSelector).first().waitFor({ state: "visible", timeout: Math.max(timeout, 20_000) });
-					else await pg.waitForURL((u) => !u.pathname.startsWith(a.path), { timeout: Math.max(timeout, 20_000) });
+					const ok = a.successSelector
+						? pg.locator(a.successSelector).first().waitFor({ state: "visible", timeout: Math.max(timeout, 20_000) })
+						: pg.waitForURL((u) => !u.pathname.startsWith(a.path), { timeout: Math.max(timeout, 20_000) });
+					await ok.catch(async () => {
+						const msg = await pg.locator("[role=alert], .error, [class*=error], [class*=toast]").allInnerTexts().catch(() => [] as string[]);
+						throw new Error(`login${currentUser ? ` as ${currentUser}` : ""} failed: still on ${pg.url()}${msg.length ? `. Page says: ${clip(msg.join(" | "), 300)}` : ""}`);
+					});
 					await settle(pg);
 					// let client-side redirects (e.g. "/" → role dashboard) finish before reporting
 					for (let i = 0, last = ""; i < 10 && pg.url() !== last; i++) {
@@ -634,7 +723,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					await settle(pg);
 					await pg.context().storageState({ path: authFile(l), indexedDB: true });
-					return text(withHints(`logged in → ${pg.url()} (session saved; later contexts reuse it)`));
+					return text(withHints(`logged in${currentUser ? ` as ${currentUser}` : ""} → ${pg.url()} (session saved; switch back later with reset {user:"${currentUser ?? ""}"})`));
 				}
 			}
 			throw new Error(`unknown action ${p.action}`);
@@ -754,7 +843,7 @@ export default function (pi: ExtensionAPI) {
 					return text(`tapped ${label}`);
 				}
 				case "type": {
-					const v = (secret(p.value) ?? "").replace(/ /g, "%s").replace(/'/g, `'\\''`);
+					const v = (secret(l, p.value) ?? "").replace(/ /g, "%s").replace(/'/g, `'\\''`);
 					await adb(["shell", `input text '${v}'`]);
 					return text("typed"); // never echo the value
 				}
@@ -780,11 +869,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("e2e", {
-		description: "E2E stack: /e2e up|down|status [service...] | /e2e logs <service> | /e2e setup (download headless Chromium)",
+		description:
+			"E2E: /e2e up|down|status [service...] | logs <service> | setup | cred [list|add <user>|rm <user>|rename <from> <to>]",
 		getArgumentCompletions: (prefix) =>
-			["up", "down", "status", "logs", "setup"].filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c })),
+			["up", "down", "status", "logs", "setup", "cred list", "cred add ", "cred rm ", "cred rename "]
+				.filter((c) => c.startsWith(prefix))
+				.map((c) => ({ value: c, label: c })),
 		handler: async (args, ctx) => {
 			const [action = "status", ...names] = args.trim().split(/\s+/).filter(Boolean);
+			if (action === "cred") {
+				try {
+					await credCommand(loadConfig(ctx.cwd), names, ctx);
+				} catch (e) {
+					ctx.ui.notify((e as Error).message, "error");
+				}
+				return;
+			}
 			if (action === "setup") {
 				ctx.ui.notify("downloading headless Chromium (~110 MB, once per machine)…", "info");
 				try {
@@ -819,6 +919,64 @@ export default function (pi: ExtensionAPI) {
 			}
 			updateStatus(ctx);
 		},
+	});
+
+	// ───── credential safety ─────
+
+	/** Credentials typed in chat are moved to the private store and replaced with $CRED refs before the model sees them. */
+	pi.on("input", async (event, ctx) => {
+		if (event.source === "extension" || event.text.startsWith("/")) return { action: "continue" };
+		let l: Loaded;
+		try {
+			l = loadConfig(ctx.cwd);
+		} catch {
+			return { action: "continue" }; // no e2e project here
+		}
+		if (l.cfg.captureCredentials === false) return { action: "continue" };
+		// also catch values that are already known, e.g. pasted again later
+		const known = redact(event.text);
+		const users = credUsers(l.root, l.cfg.credentials);
+		const { text: out, captured } = captureFromText(known, users, () => (users.includes("user") ? `user${users.length + 1}` : "user"));
+		if (!captured.length) return known === event.text ? { action: "continue" } : { action: "transform", text: known, images: event.images };
+		const byUser = new Map<string, Record<string, string>>();
+		for (const c of captured) byUser.set(c.user, { ...(byUser.get(c.user) ?? {}), [c.field]: c.value });
+		for (const [u, f] of byUser) saveCred(l.root, u, f);
+		const summary = [...byUser].map(([u, f]) => `${u} (${Object.keys(f).join(", ")})`).join("; ");
+		if (ctx.hasUI) ctx.ui.notify(`🔒 saved credentials for ${summary}. The model only sees $CRED references. Rename: /e2e cred rename <from> <to>`, "info");
+		return {
+			action: "transform",
+			text: `${out}\n\n[e2e: credentials were stored securely and replaced with references: ${captured.map((c) => `$CRED:${c.user}.${c.field}`).join(", ")}. Use these references as-is in browser/mobile values; never ask for or print the real values.]`,
+			images: event.images,
+		};
+	});
+
+	/** Tool calls may only carry references. If the model wrote a real secret, swap it back to its reference. */
+	pi.on("tool_call", async (event) => {
+		if (!hasSecrets()) return;
+		const red = redactDeep(event.input);
+		if (red !== event.input) Object.assign(event.input, red);
+	});
+
+	/** Scrub secrets from every tool result (bash, read, browser text, logs…) before the model sees it. */
+	pi.on("tool_result", async (event) => {
+		if (!hasSecrets()) return;
+		const content = redactDeep(event.content);
+		const structured = redactDeep(event.structuredContent);
+		if (content === event.content && structured === event.structuredContent) return;
+		return { content, structuredContent: structured };
+	});
+
+	/** Last line of defence: scrub anything already in the conversation before each model call. */
+	pi.on("context", async (event) => {
+		if (!hasSecrets()) return;
+		const messages = redactDeep(event.messages);
+		if (messages !== event.messages) return { messages };
+	});
+
+	pi.on("session_start", async (_e, ctx) => {
+		try {
+			loadConfig(ctx.cwd); // registers secrets for redaction early
+		} catch {}
 	});
 
 	// Last-resort cleanup if pi exits without a clean session_shutdown (crash, Ctrl+C twice).

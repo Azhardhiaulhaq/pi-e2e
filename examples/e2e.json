@@ -1,5 +1,15 @@
 {
   "artifactsDir": ".e2e-artifacts",
+  "credentials": {
+    "admin": {
+      "email": "$ENV:E2E_ADMIN_EMAIL",
+      "password": "$ENV:E2E_ADMIN_PASS"
+    },
+    "driver": {
+      "email": "$ENV:E2E_DRIVER_EMAIL",
+      "password": "$ENV:E2E_DRIVER_PASS"
+    }
+  },
   "services": {
     "api": {
       "cwd": "backend",
@@ -13,20 +23,32 @@
       "command": "pnpm exec next dev --port ${PORT}",
       "port": 3000,
       "health": "/",
-      "env": { "NEXT_PUBLIC_API_BASE_URL": "${api.url}" }
+      "env": {
+        "NEXT_PUBLIC_API_BASE_URL": "${api.url}"
+      }
     }
   },
   "browser": {
     "baseUrl": "${web.url}",
-    "viewport": [1440, 900],
+    "viewport": [
+      1440,
+      900
+    ],
     "auth": {
       "path": "/login",
-      "fields": { "#email": "$ENV:E2E_USER", "#password": "$ENV:E2E_PASS" },
-      "submit": "button[type=submit]"
+      "fields": {
+        "#email": "{{email|username}}",
+        "#password": "{{password}}"
+      },
+      "submit": "button[type=submit]",
+      "defaultUser": "admin"
     }
   },
   "mobile": {
     "platform": "android",
-    "android": { "package": "com.example.app", "reversePorts": true }
+    "android": {
+      "package": "com.example.app",
+      "reversePorts": true
+    }
   }
 }
